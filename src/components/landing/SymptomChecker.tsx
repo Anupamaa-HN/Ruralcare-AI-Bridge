@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Mic, Send, Loader2, User, Bot } from "lucide-react";
+import { Mic, Send, Loader2, User, Bot, AlertCircle } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
+
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/symptom-checker`;
 
 const exampleSymptoms = [
   "I have had fever for 3 days with body pain",
@@ -9,30 +12,119 @@ const exampleSymptoms = [
   "सांस लेने में तकलीफ हो रही है",
 ];
 
+type Message = { role: "user" | "assistant"; content: string };
+
 const SymptomChecker = () => {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [messages, setMessages] = useState<{ role: "user" | "bot"; content: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const { toast } = useToast();
+  const abortControllerRef = useRef<AbortController | null>(null);
 
-  const handleSend = () => {
-    if (!input.trim()) return;
+  const streamChat = useCallback(async (userMessages: Message[]) => {
+    abortControllerRef.current = new AbortController();
     
-    setMessages((prev) => [...prev, { role: "user", content: input }]);
+    const resp = await fetch(CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({ 
+        messages: userMessages.map(m => ({ 
+          role: m.role === "assistant" ? "assistant" : "user", 
+          content: m.content 
+        }))
+      }),
+      signal: abortControllerRef.current.signal,
+    });
+
+    if (!resp.ok) {
+      const errorData = await resp.json().catch(() => ({}));
+      if (resp.status === 429) {
+        throw new Error("Rate limit exceeded. Please wait a moment and try again.");
+      }
+      if (resp.status === 402) {
+        throw new Error("Service temporarily unavailable. Please try again later.");
+      }
+      throw new Error(errorData.error || "Failed to get response");
+    }
+
+    if (!resp.body) throw new Error("No response body");
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let textBuffer = "";
+    let assistantContent = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      textBuffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex: number;
+      while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+        let line = textBuffer.slice(0, newlineIndex);
+        textBuffer = textBuffer.slice(newlineIndex + 1);
+
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line.startsWith(":") || line.trim() === "") continue;
+        if (!line.startsWith("data: ")) continue;
+
+        const jsonStr = line.slice(6).trim();
+        if (jsonStr === "[DONE]") break;
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+          if (content) {
+            assistantContent += content;
+            setMessages(prev => {
+              const last = prev[prev.length - 1];
+              if (last?.role === "assistant") {
+                return prev.map((m, i) => 
+                  i === prev.length - 1 ? { ...m, content: assistantContent } : m
+                );
+              }
+              return [...prev, { role: "assistant", content: assistantContent }];
+            });
+          }
+        } catch {
+          textBuffer = line + "\n" + textBuffer;
+          break;
+        }
+      }
+    }
+  }, []);
+
+  const handleSend = async () => {
+    if (!input.trim() || isLoading) return;
+    
+    const userMessage: Message = { role: "user", content: input };
+    const newMessages = [...messages, userMessage];
+    
+    setMessages(newMessages);
     setIsLoading(true);
+    setError(null);
     setInput("");
 
-    // Simulate AI response
-    setTimeout(() => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "bot",
-          content:
-            "Based on your symptoms of fever and body pain for 3 days, I recommend:\n\n1. **Rest and hydration** - Drink plenty of fluids\n2. **Paracetamol 500mg** - Take every 6 hours for fever\n3. **Monitor temperature** - Seek medical help if fever exceeds 103°F\n\nWould you like me to check your ABHA records for any relevant medical history?",
-        },
-      ]);
+    try {
+      await streamChat(newMessages);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Something went wrong";
+      setError(errorMessage);
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: errorMessage,
+      });
+      // Remove the failed assistant message if any
+      setMessages(prev => prev.filter((_, i) => i < newMessages.length));
+    } finally {
       setIsLoading(false);
-    }, 2000);
+    }
   };
 
   const handleExampleClick = (example: string) => {
@@ -101,7 +193,7 @@ const SymptomChecker = () => {
                   </div>
                 </div>
               ) : (
-                messages.map((msg, i) => (
+              messages.map((msg, i) => (
                   <div
                     key={i}
                     className={`flex gap-3 ${msg.role === "user" ? "flex-row-reverse" : ""}`}
