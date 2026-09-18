@@ -7,10 +7,17 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const MessageSchema = z.object({
-  role: z.enum(["user", "assistant"]),
-  content: z.string().min(1).max(2000),
-});
+const MessageSchema = z.discriminatedUnion("role", [
+  z.object({
+    role: z.literal("user"),
+    content: z.string().trim().min(1).max(2000),
+  }),
+  z.object({
+    role: z.literal("assistant"),
+    // Bilingual streamed replies can be longer than a user's symptom note.
+    content: z.string().trim().min(1).max(12000),
+  }),
+]);
 
 const RequestSchema = z.object({
   messages: z.array(MessageSchema).min(1).max(50),
